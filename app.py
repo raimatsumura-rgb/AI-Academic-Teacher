@@ -11,9 +11,26 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder # إضافة MessagesPlaceholder
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
+import streamlit.components.v1 as components # إضافة استيراد المكونات للحل
 
 # --- 1. الإعدادات الأساسية للواجهة ---
 st.set_page_config(page_title="AI Academic Teacher", layout="wide", page_icon="🎓")
+
+# --- حقنة JavaScript لحل مشكلة تعليق الواجهة عند العودة من تطبيقات أخرى ---
+# هذا الكود يراقب حالة الرؤية (Visibility)؛ بمجرد عودة المستخدم للموقع، يتأكد من أن الاتصال فعال
+components.html(
+    """
+    <script>
+    document.addEventListener("visibilitychange", function() {
+        if (document.visibilityState === 'visible') {
+            // التحقق مما إذا كان هناك تعليق في الاتصال وإصلاحه عبر إرسال إشارة خفيفة للسيرفر
+            window.parent.postMessage({type: 'streamlit:setComponentValue', value: Math.random()}, '*');
+        }
+    });
+    </script>
+    """,
+    height=0,
+)
 
 # ** تهيئة المتغيرات لضمان استقرار الجلسة **
 if 'selected_lang' not in st.session_state:
@@ -44,7 +61,21 @@ with st.sidebar:
     
     t = lang_dict[st.session_state.selected_lang]
     
-    api_key_input = st.text_input(t["api_key_label"], type="password", placeholder=t["api_key_placeholder"])
+    # --- منطق الـ API Key المطور والآمن من الانهيار ---
+    try:
+        # محاولة جلب المفتاح من Secrets (تعمل في السحاب)
+        api_key_from_secrets = st.secrets.get("GROQ_API_KEY")
+    except:
+        # إذا كنا نشغل الكود محلياً (Localhost) ولا يوجد ملف Secrets
+        api_key_from_secrets = None
+    
+    if api_key_from_secrets:
+        api_key_input = api_key_from_secrets
+        st.success("✅ API Key loaded from Secrets")
+    else:
+        # يظهر هذا الحقل فقط إذا فشل النظام في العثور على السر (مثل جهازك الآن)
+        api_key_input = st.text_input(t["api_key_label"], type="password", placeholder=t["api_key_placeholder"])
+    # ------------------------------------------------------------
     
     st.markdown("---")
     st.markdown(f"### {t['sidebar_header']}")
@@ -71,11 +102,21 @@ with st.sidebar:
 if t["direction"] == "rtl":
     st.markdown("""<style> .main { direction: rtl; text-align: right; } </style>""", unsafe_allow_html=True)
 
-# --- 3. محرك معالجة البيانات ---
+# --- 3. محرك معالجة البيانات (مع تفعيل التخزين المؤقت للسرعة) ---
 
 @st.cache_resource
 def load_embeddings():
+    """تحميل نموذج التضمين مرة واحدة فقط في الذاكرة لتسريع التطبيق"""
     return HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+@st.cache_resource
+def get_llm_instance(api_key, model_name):
+    """تحميل نسخة الموديل مرة واحدة لتقليل زمن الاستجابة"""
+    return ChatGroq(
+        temperature=0.0,
+        model_name=model_name, 
+        groq_api_key=api_key
+    )
 
 def process_docs_to_vectorstore(uploaded_files):
     raw_text = extract_text_from_files(uploaded_files)
@@ -111,41 +152,33 @@ def get_filtered_context(user_input, vectorstore):
         page_content = doc.page_content
         
         # --- لمسة المهندس: مرشح استبعاد الفهرس ---
-        # إذا كانت الصفحة تحتوي على نقاط متتابعة (تستخدم عادة في الفهارس)
-        # أو تحتوي على كلمات تدل على الفهرس في أولها، نقوم بتخطيها
         index_indicators = ["........", " . . . ", "...."]
         if any(indicator in page_content for indicator in index_indicators):
-            continue # تخطي هذه القطعة النصية لأنها "ضجيج" فهرس
-        # ---------------------------------------
+            continue 
 
         raw_page = doc.metadata.get("page")
         
-        # إذا وجد رقم الصفحة، نجهزه بالتنسيق المطلوب (مع إزاحة +1)
         if isinstance(raw_page, int):
             page_header = f"[REFERENCE SOURCE: Page {raw_page + 1}]\n"
         else:
             page_header = "" 
         
-        # دمج الترويسة مع محتوى النص النظيف
         content = f"{page_header}{page_content}"
         context_parts.append(content)
     
-    # في حال تم استبعاد كل القطع لأنها فهرس (حالة نادرة)
     if not context_parts:
         return "NO_DATA_FOUND"
 
     return "\n\n---\n\n".join(context_parts)
 
-# --- 5. نظام الـ Prompts المطور (الذكاء المزدوج مع الذاكرة) ---
+# --- 5. نظام الـ Prompts المطور ---
 
 def get_academic_chain(api_key, has_context, model_name="llama-3.3-70b-versatile"):
-    llm = ChatGroq(
-        temperature=0.0,
-        model_name=model_name, 
-        groq_api_key=api_key
-    )
+    # استخدام الدالة المخبأة (Cached) لجلب الـ LLM بسرعة
+    llm = get_llm_instance(api_key, model_name)
     
     if not has_context:
+        # [ملاحظة: تم الإبقاء على نص التعليمات البرمجية كما هو في ملفك الأصلي]
         system_instruction = """You are a World-Class Academic Polymath and Polyglot Teacher. 
             You possess deep, specialized expertise across diverse academic domains including:
             - Medicine & Life Sciences.
@@ -165,7 +198,7 @@ def get_academic_chain(api_key, has_context, model_name="llama-3.3-70b-versatile
             - Social Greeting Protocol: If the user greets you (e.g., "Hi", "Hello", "مرحبا") or engages in small talk, respond as a polite, welcoming teacher. Acknowledge the greeting briefly, then immediately invite them to ask about the academic content or the uploaded documents.
             - Boundary Setting: If the user attempts to drift into irrelevant personal or non-academic topics, politely steer them back by saying: "As your academic guide, I am here to focus on your studies and the materials provided. Let's get back to the subject matter."
             - Creator Identity: If the user asks about your creator, developer, or who designed you, respond with pride that you were developed and designed by Eng. Rai Matsumura who is a professional Japanese-Syrian AI Engineer and English Literature Specialist based in Tokyo, Japan. He studied at Damascus University and Syrian Virtual University (SVU).
-           6. ACADEMIC ENGAGEMENT (NO-CONTEXT MODE): 
+            6. ACADEMIC ENGAGEMENT (NO-CONTEXT MODE): 
             - If the student asks about academic or scientific concepts, theories, or historical facts, scientists, provide a high-level expert explanation based on your internal knowledge. 
             - Encourage intellectual curiosity by explaining the "Why" and "How" behind the concept.
             - Transition naturally by mentioning that for a more tailored analysis based on their specific curriculum, they should upload their related study materials.
@@ -211,7 +244,7 @@ def get_academic_chain(api_key, has_context, model_name="llama-3.3-70b-versatile
             * "{header_in_other}": Followed by a multi-sentence pedagogical deep-dive.
             * **TABLES:** IF the question involves comparisons, data analysis, or distinct categories, you MUST present the core information in a Markdown Table for clarity.
             * "{header_summary}": Followed by a concise synthesis.
-            - **PAGE CITATION RULE:** If page number available, mention it (Page: X). If NOT available, ignore it. If the user explicitly asks for the page number and it is not available in the metadata, clearly state that you couldn't retrieve it.
+            * **PAGE CITATION RULE:** If page number available, mention it (Page: X). If NOT available, ignore it. If the user explicitly asks for the page number and it is not available in the metadata, clearly state that you couldn't retrieve it.
 
             8. CHAT HISTORY: Use the provided chat history to answer meta-questions about the conversation (e.g., "What was my first question?").
 
@@ -223,10 +256,9 @@ def get_academic_chain(api_key, has_context, model_name="llama-3.3-70b-versatile
 
             10. ARABIC PROCESSING: Fix any encoding or structural issues in Arabic context before extraction to ensure no technical terms are lost."""
 
-    # تحسين الـ Prompt لدعم الذاكرة (Chat History)
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_instruction),
-        MessagesPlaceholder(variable_name="chat_history"), # هنا تكمن الذاكرة الخارقة
+        MessagesPlaceholder(variable_name="chat_history"),
         ("human", "ACADEMIC CONTEXT:\n{context}\n\nSTUDENT QUESTION: {question}")
     ])
     
@@ -259,7 +291,6 @@ else:
             st.markdown(message["content"])
 
     if user_query := st.chat_input(t["input_placeholder"]):
-        # تخزين سؤال المستخدم
         st.session_state.messages.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.markdown(user_query)
@@ -279,9 +310,7 @@ else:
                 h_summary = t.get("summary", "Summary:")
                 h_external = t.get("external_context", "External Academic Context:")
 
-                # 1. تجهيز تاريخ المحادثة للنموذج (تحويلها لكائنات رسائل رسمية)
                 chat_history = []
-                # نأخذ آخر 6 رسائل لضمان بقاء السياق حياً دون إثقال الذاكرة
                 for m in st.session_state.messages[-6:-1]:
                     if m["role"] == "user":
                         chat_history.append(HumanMessage(content=m["content"]))
@@ -289,14 +318,12 @@ else:
                         chat_history.append(AIMessage(content=m["content"]))
                 
                 try:
-                    # 2. جلب السلسلة الأكاديمية
                     chain = get_academic_chain(api_key_input, has_vectorstore, model_name="llama-3.3-70b-versatile")
                     
-                    # 3. التنفيذ مع تمرير الذاكرة والسياق
                     response = chain.invoke({
                         "context": context,
                         "question": user_query,
-                        "chat_history": chat_history,  # الذاكرة الآن رسمية واحترافية
+                        "chat_history": chat_history,
                         "language": st.session_state.selected_lang,
                         "header_according": h_according,
                         "header_in_other": h_in_other,
@@ -318,7 +345,7 @@ else:
                         response = chain.invoke({
                             "context": context,
                             "question": user_query,
-                            "chat_history": chat_history, # تمرير الذاكرة هنا للنموذج البديل أيضاً
+                            "chat_history": chat_history,
                             "language": st.session_state.selected_lang,
                             "header_according": h_according,
                             "header_in_other": h_in_other,

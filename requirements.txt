@@ -4,7 +4,9 @@ langchain-groq
 langchain-huggingface
 langchain-community
 faiss-cpu
+PyPDF2
 pypdf
 python-docx
 python-pptx
 sentence-transformers
+huggingface_hub
